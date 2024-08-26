@@ -476,7 +476,7 @@ static PHP_FUNCTION(datadog_appsec_testing_request_exec)
         RETURN_FALSE;
     }
 
-    if (dd_request_exec(conn, data) != dd_success) {
+    if (dd_request_exec(conn, data, false) != dd_success) {
         RETURN_FALSE;
     }
 
@@ -494,7 +494,9 @@ static PHP_FUNCTION(datadog_appsec_push_address)
 
     zend_string *key = NULL;
     zval *value = NULL;
-    if (zend_parse_parameters(ZEND_NUM_ARGS(), "Sz", &key, &value) == FAILURE) {
+    bool rasp = false;
+    if (zend_parse_parameters(ZEND_NUM_ARGS(), "Sz|b", &key, &value, &rasp) ==
+        FAILURE) {
         RETURN_FALSE;
     }
 
@@ -511,7 +513,7 @@ static PHP_FUNCTION(datadog_appsec_push_address)
         return;
     }
 
-    dd_result res = dd_request_exec(conn, &parameters_zv);
+    dd_result res = dd_request_exec(conn, &parameters_zv, rasp);
     zval_ptr_dtor(&parameters_zv);
 
     if (dd_req_is_user_req()) {
@@ -538,6 +540,7 @@ ZEND_END_ARG_INFO()
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(push_address_arginfo, 0, 0, IS_VOID, 1)
 ZEND_ARG_INFO(0, key)
 ZEND_ARG_INFO(0, value)
+ZEND_ARG_INFO(0, rasp)
 ZEND_END_ARG_INFO()
 
 // clang-format off

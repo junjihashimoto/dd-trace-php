@@ -7,11 +7,13 @@
 #include "request_shutdown.h"
 #include "../commands_helpers.h"
 #include "../ddappsec.h"
+#include "../ddtrace.h"
 #include "../entity_body.h"
 #include "../msgpack_helpers.h"
 #include "../php_compat.h"
 #include "../php_objects.h"
 #include "../string_helpers.h"
+#include "mpack.h"
 #include <SAPI.h>
 
 static dd_result _request_pack(mpack_writer_t *nonnull w, void *nonnull ctx);
@@ -27,7 +29,7 @@ static const char *nullable _header_content_type_zend_array(
 static const dd_command_spec _spec = {
     .name = "request_shutdown",
     .name_len = sizeof("request_shutdown") - 1,
-    .num_args = 1, // a single map
+    .num_args = 2, // map for waf last run; remote cfg path
     .outgoing_cb = _request_pack,
     .incoming_cb = dd_command_proc_resp_verd_span_data,
     .config_features_cb = dd_command_process_config_features_unexpected,
@@ -60,9 +62,10 @@ static dd_result _request_pack(mpack_writer_t *nonnull w, void *nonnull ctx)
         }
     }
 
+    // 1.
     mpack_start_map(w, 2 + (Z_TYPE(resp_body) != IS_NULL ? 1 : 0));
 
-    // 1.
+    // 1.1.
     {
         _Static_assert(sizeof(int) == 4, "expected 32-bit int");
         dd_mpack_write_lstr(w, "server.response.status");
@@ -71,7 +74,7 @@ static dd_result _request_pack(mpack_writer_t *nonnull w, void *nonnull ctx)
         mpack_write_str(w, buf, (uint32_t)size);
     }
 
-    // 2.
+    // 1.2.
     dd_mpack_write_lstr(w, "server.response.headers.no_cookies");
     if (req_info->resp_headers_fmt == RESP_HEADERS_LLIST) {
         _pack_headers_no_cookies_llist(w, req_info->resp_headers_llist);
@@ -79,7 +82,7 @@ static dd_result _request_pack(mpack_writer_t *nonnull w, void *nonnull ctx)
         _pack_headers_no_cookies_map(w, req_info->resp_headers_arr);
     }
 
-    // 3.?
+    // 1.3.?
     if (Z_TYPE(resp_body) != IS_NULL) {
         dd_mpack_write_lstr(w, "server.response.body");
         dd_mpack_write_zval(w, &resp_body);
@@ -87,6 +90,9 @@ static dd_result _request_pack(mpack_writer_t *nonnull w, void *nonnull ctx)
     }
 
     mpack_finish_map(w);
+
+    // 2.
+    dd_mpack_write_nullable_cstr(w, dd_trace_remote_config_get_path());
 
     return dd_success;
 }

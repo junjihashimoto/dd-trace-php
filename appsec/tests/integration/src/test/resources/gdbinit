@@ -1,4 +1,5 @@
 set verbose off
 set confirm off
+set follow-fork-mode child
 handle SIGPIPE nostop print pass
 catch throw

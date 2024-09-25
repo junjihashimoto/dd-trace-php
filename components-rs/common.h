@@ -360,6 +360,10 @@ typedef enum ddog_RemoteConfigCapabilities {
 typedef enum ddog_RemoteConfigProduct {
   DDOG_REMOTE_CONFIG_PRODUCT_APM_TRACING,
   DDOG_REMOTE_CONFIG_PRODUCT_LIVE_DEBUGGER,
+  DDOG_REMOTE_CONFIG_PRODUCT_ASM,
+  DDOG_REMOTE_CONFIG_PRODUCT_ASM_DD,
+  DDOG_REMOTE_CONFIG_PRODUCT_ASM_DATA,
+  DDOG_REMOTE_CONFIG_PRODUCT_ASM_FEATURES,
 } ddog_RemoteConfigProduct;
 
 typedef enum ddog_SpanProbeTarget {

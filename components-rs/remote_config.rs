@@ -1,50 +1,80 @@
-use std::borrow::Cow;
+use crate::sidecar::MaybeShmLimiter;
+use datadog_dynamic_configuration::{data::TracingSamplingRuleProvenance, Configs};
+use datadog_live_debugger::debugger_defs::{DebuggerData, DebuggerPayload};
 use datadog_live_debugger::{FilterList, LiveDebuggingData, ServiceConfiguration};
-use datadog_live_debugger_ffi::data::{Probe};
+use datadog_live_debugger_ffi::data::Probe;
 use datadog_live_debugger_ffi::evaluator::{ddog_register_expr_evaluator, Evaluator};
-use datadog_dynamic_configuration::{Configs, data::TracingSamplingRuleProvenance};
-use datadog_remote_config::{RemoteConfigCapabilities, RemoteConfigData, RemoteConfigProduct, Target};
+use datadog_live_debugger_ffi::send_data::{
+    ddog_debugger_diagnostics_create_unboxed, ddog_snapshot_redacted_type,
+};
 use datadog_remote_config::fetch::ConfigInvariants;
+use datadog_remote_config::{
+    RemoteConfigCapabilities, RemoteConfigData, RemoteConfigProduct, Target,
+};
+use datadog_sidecar::service::blocking::SidecarTransport;
+use datadog_sidecar::service::{InstanceId, QueueId};
 use datadog_sidecar::shm_remote_config::{RemoteConfigManager, RemoteConfigUpdate};
+use datadog_sidecar_ffi::ddog_sidecar_send_debugger_data;
 use ddcommon::Endpoint;
 use ddcommon_ffi::slice::AsBytes;
 use ddcommon_ffi::{CharSlice, MaybeError};
 use itertools::Itertools;
-use std::collections::{HashMap, HashSet};
+use regex_automata::dfa::regex::Regex;
+use serde::Serialize;
+use std::borrow::Cow;
 use std::collections::hash_map::Entry;
-use std::ffi::c_char;
+use std::collections::{HashMap, HashSet};
+use std::ffi::{c_char, CStr, CString};
 use std::mem;
 use std::sync::Arc;
-use serde::Serialize;
-use crate::sidecar::MaybeShmLimiter;
-use regex_automata::dfa::regex::Regex;
+use std::sync::LazyLock;
 use tracing::debug;
-use datadog_live_debugger::debugger_defs::{DebuggerData, DebuggerPayload};
-use datadog_live_debugger_ffi::send_data::{ddog_debugger_diagnostics_create_unboxed, ddog_snapshot_redacted_type};
-use datadog_sidecar::service::blocking::SidecarTransport;
-use datadog_sidecar::service::{InstanceId, QueueId};
-use datadog_sidecar_ffi::ddog_sidecar_send_debugger_data;
 
-type DynamicConfigUpdate = for <'a> extern "C" fn(config: CharSlice, value: CharSlice, return_old: bool) -> *mut Vec<c_char>;
+type DynamicConfigUpdate = for<'a> extern "C" fn(
+    config: CharSlice,
+    value: CharSlice,
+    return_old: bool,
+) -> *mut Vec<c_char>;
 
 static mut LIVE_DEBUGGER_CALLBACKS: Option<LiveDebuggerCallbacks> = None;
 static mut DYNAMIC_CONFIG_UPDATE: Option<DynamicConfigUpdate> = None;
 
 #[no_mangle]
-pub static DDTRACE_REMOTE_CONFIG_PRODUCTS: [RemoteConfigProduct; 2] = [
+pub static DDTRACE_REMOTE_CONFIG_PRODUCTS: [RemoteConfigProduct; 6] = [
     RemoteConfigProduct::ApmTracing,
+    RemoteConfigProduct::AsmFeatures,
+    RemoteConfigProduct::AsmData,
+    RemoteConfigProduct::Asm,
+    RemoteConfigProduct::AsmDD,
     RemoteConfigProduct::LiveDebugger,
 ];
 
 #[no_mangle]
-pub static DDTRACE_REMOTE_CONFIG_CAPABILITIES: [RemoteConfigCapabilities; 6] = [
+pub static DDTRACE_REMOTE_CONFIG_CAPABILITIES: [RemoteConfigCapabilities; 16] = [
     RemoteConfigCapabilities::ApmTracingCustomTags,
     RemoteConfigCapabilities::ApmTracingEnabled,
     RemoteConfigCapabilities::ApmTracingHttpHeaderTags,
     RemoteConfigCapabilities::ApmTracingLogsInjection,
     RemoteConfigCapabilities::ApmTracingSampleRate,
     RemoteConfigCapabilities::ApmTracingSampleRules,
+    RemoteConfigCapabilities::AsmActivation,
+    RemoteConfigCapabilities::AsmExclusions,
+    RemoteConfigCapabilities::AsmCustomBlockingResponse,
+    RemoteConfigCapabilities::AsmRequestBlocking,
+    RemoteConfigCapabilities::AsmResponseBlocking,
+    RemoteConfigCapabilities::AsmCustomRules,
+    RemoteConfigCapabilities::AsmTrustedIps,
+    RemoteConfigCapabilities::AsmDdRules,
+    RemoteConfigCapabilities::AsmIpBlocking,
+    RemoteConfigCapabilities::AsmUserBlocking,
 ];
+
+static DDTRACE_REMOTE_CONFIG_APM_CAPABILITIES: LazyLock<&[RemoteConfigCapabilities]> =
+    LazyLock::new(|| &DDTRACE_REMOTE_CONFIG_CAPABILITIES[0..6]);
+
+// does not include AsmActivation
+static DDTRACE_REMOTE_CONFIG_ASM_CAPABILITIES: LazyLock<&[RemoteConfigCapabilities]> =
+    LazyLock::new(|| &DDTRACE_REMOTE_CONFIG_CAPABILITIES[7..]);
 
 #[derive(Default)]
 struct DynamicConfig {
@@ -87,19 +117,36 @@ pub unsafe extern "C" fn ddog_init_remote_config(
     tracer_version: CharSlice,
     endpoint: &Endpoint,
     live_debugging_enabled: bool,
+    appsec_features: bool,
+    appsec_config: bool,
 ) -> Box<RemoteConfigState> {
     let mut products = vec![RemoteConfigProduct::ApmTracing];
+    let mut capabilities = DDTRACE_REMOTE_CONFIG_APM_CAPABILITIES.to_vec();
+    // XXX: add unconditionally for now
+    // if appsec_features {
+    products.push(RemoteConfigProduct::AsmFeatures);
+    capabilities.push(RemoteConfigCapabilities::AsmActivation);
+    // }
+    // if appsec_config {
+    products.extend_from_slice(&[
+        RemoteConfigProduct::AsmData,
+        RemoteConfigProduct::Asm,
+        RemoteConfigProduct::AsmDD,
+    ]);
+    capabilities.extend_from_slice(&DDTRACE_REMOTE_CONFIG_ASM_CAPABILITIES);
+    // }
+
     if live_debugging_enabled {
         products.push(RemoteConfigProduct::LiveDebugger);
     }
-    
+
     Box::new(RemoteConfigState {
         manager: RemoteConfigManager::new(ConfigInvariants {
             language: "php".to_string(),
             tracer_version: tracer_version.to_utf8_lossy().into(),
             endpoint: endpoint.clone(),
             products,
-            capabilities: DDTRACE_REMOTE_CONFIG_CAPABILITIES.to_vec(),
+            capabilities,
         }),
         live_debugger: LiveDebuggerState::default(),
         dynamic_config: Default::default(),
@@ -121,31 +168,40 @@ struct SampleRule<'a> {
 
 fn map_config(config: &Configs) -> (&'static str, String) {
     match config {
-        Configs::TracingHeaderTags(tags) => {
-            ("datadog.trace.header_tags", tags.iter().map(|(k, _)| k).join(","))
-        }
-        Configs::TracingSampleRate(rate) => {
-            ("datadog.trace.sample_rate", rate.to_string())
-        }
-        Configs::LogInjectionEnabled(enabled) => {
-            ("datadog.logs_injection", (if *enabled { "1" } else { "0" }).to_string())
-        }
-        Configs::TracingTags(tags) => {
-            ("datadog.tags", tags.join(","))
-        }
-        Configs::TracingEnabled(enabled) => {
-            ("datadog.trace.enabled", (if *enabled { "1" } else { "0" }).to_string())
-        }
+        Configs::TracingHeaderTags(tags) => (
+            "datadog.trace.header_tags",
+            tags.iter().map(|(k, _)| k).join(","),
+        ),
+        Configs::TracingSampleRate(rate) => ("datadog.trace.sample_rate", rate.to_string()),
+        Configs::LogInjectionEnabled(enabled) => (
+            "datadog.logs_injection",
+            (if *enabled { "1" } else { "0" }).to_string(),
+        ),
+        Configs::TracingTags(tags) => ("datadog.tags", tags.join(",")),
+        Configs::TracingEnabled(enabled) => (
+            "datadog.trace.enabled",
+            (if *enabled { "1" } else { "0" }).to_string(),
+        ),
         Configs::TracingSamplingRules(rules) => {
-            let map: Vec<_> = rules.iter().map(|r| SampleRule {
-                name: r.name.as_deref(),
-                service: r.service.as_str(),
-                resource: r.resource.as_str(),
-                tags: r.tags.iter().map(|t| (t.key.as_str(), t.value_glob.as_str())).collect(),
-                provenance: r.provenance,
-                sample_rate: r.sample_rate,
-            }).collect();
-            ("datadog.trace.sampling_rules", serde_json::to_string(&map).unwrap())
+            let map: Vec<_> = rules
+                .iter()
+                .map(|r| SampleRule {
+                    name: r.name.as_deref(),
+                    service: r.service.as_str(),
+                    resource: r.resource.as_str(),
+                    tags: r
+                        .tags
+                        .iter()
+                        .map(|t| (t.key.as_str(), t.value_glob.as_str()))
+                        .collect(),
+                    provenance: r.provenance,
+                    sample_rate: r.sample_rate,
+                })
+                .collect();
+            (
+                "datadog.trace.sampling_rules",
+                serde_json::to_string(&map).unwrap(),
+            )
         }
     }
 }
@@ -158,12 +214,17 @@ fn remove_old_configs(remote_config: &mut RemoteConfigState) {
     remote_config.dynamic_config.active_config_path = None;
 }
 
-fn insert_new_configs(old_config_values: &mut HashMap<String, Vec<c_char>>, old_configs: &mut Vec<Configs>, new_configs: Vec<Configs>) {
+fn insert_new_configs(
+    old_config_values: &mut HashMap<String, Vec<c_char>>,
+    old_configs: &mut Vec<Configs>,
+    new_configs: Vec<Configs>,
+) {
     let mut found_configs = HashSet::new();
     for config in new_configs.iter() {
         let (name, val) = map_config(config);
         let is_update = old_config_values.contains_key(name);
-        let original = unsafe { DYNAMIC_CONFIG_UPDATE }.unwrap()(name.into(), val.as_str().into(), !is_update);
+        let original =
+            unsafe { DYNAMIC_CONFIG_UPDATE }.unwrap()(name.into(), val.as_str().into(), !is_update);
         if !original.is_null() {
             old_config_values.insert(name.into(), *unsafe { Box::from_raw(original) });
         }
@@ -181,11 +242,24 @@ fn insert_new_configs(old_config_values: &mut HashMap<String, Vec<c_char>>, old_
 }
 
 #[no_mangle]
+pub extern "C" fn ddog_remote_config_get_path(remote_config: &RemoteConfigState) -> *const c_char {
+    remote_config
+        .manager
+        .active_reader
+        .as_ref()
+        .map(|r| r.get_path().as_ptr())
+        .unwrap_or(std::ptr::null())
+}
+
+#[no_mangle]
 pub extern "C" fn ddog_process_remote_configs(remote_config: &mut RemoteConfigState) {
     loop {
         match remote_config.manager.fetch_update() {
             RemoteConfigUpdate::None => break,
-            RemoteConfigUpdate::Add { value, limiter_index } => match value.data {
+            RemoteConfigUpdate::Add {
+                value,
+                limiter_index,
+            } => match value.data {
                 RemoteConfigData::LiveDebugger(debugger) => {
                     let val = Box::new((debugger, MaybeShmLimiter::open(limiter_index)));
                     let rc_ref = unsafe { mem::transmute(remote_config as *mut _) }; // sigh, borrow checker
@@ -195,37 +269,46 @@ pub extern "C" fn ddog_process_remote_configs(remote_config: &mut RemoteConfigSt
                             e.insert(val);
                             e.into_mut()
                         }
-                        Entry::Vacant(e) => {
-                            e.insert(val)
-                        }
+                        Entry::Vacant(e) => e.insert(val),
                     };
                     apply_config(rc_ref, debugger, limiter);
-                },
+                }
                 RemoteConfigData::DynamicConfig(config_data) => {
                     let configs: Vec<Configs> = config_data.lib_config.into();
                     if !configs.is_empty() {
-                        insert_new_configs(&mut remote_config.dynamic_config.old_config_values, &mut remote_config.dynamic_config.configs, configs);
+                        insert_new_configs(
+                            &mut remote_config.dynamic_config.old_config_values,
+                            &mut remote_config.dynamic_config.configs,
+                            configs,
+                        );
                         remote_config.dynamic_config.active_config_path = Some(value.config_id);
                     }
-                },
+                }
+                RemoteConfigData::Ignored(_) => (),
             },
             RemoteConfigUpdate::Remove(path) => match path.product {
                 RemoteConfigProduct::LiveDebugger => {
-                    if let Some(boxed) = remote_config.live_debugger.active.remove(&path.config_id) {
+                    if let Some(boxed) = remote_config.live_debugger.active.remove(&path.config_id)
+                    {
                         remove_config(remote_config, &boxed.0);
                     }
-                },
+                }
                 RemoteConfigProduct::ApmTracing => {
                     if Some(path.config_id) == remote_config.dynamic_config.active_config_path {
                         remove_old_configs(remote_config);
                     }
-                },
+                }
+                _ => (),
             },
         }
     }
 }
 
-fn apply_config(remote_config: &mut RemoteConfigState, debugger: &LiveDebuggingData, limiter: &MaybeShmLimiter) {
+fn apply_config(
+    remote_config: &mut RemoteConfigState,
+    debugger: &LiveDebuggingData,
+    limiter: &MaybeShmLimiter,
+) {
     if let Some(callbacks) = unsafe { &LIVE_DEBUGGER_CALLBACKS } {
         match debugger {
             LiveDebuggingData::Probe(probe) => {
@@ -237,7 +320,7 @@ fn apply_config(remote_config: &mut RemoteConfigState, debugger: &LiveDebuggingD
                         .spans_map
                         .insert(probe.id.clone(), hook_id);
                 }
-            },
+            }
             LiveDebuggingData::ServiceConfiguration(config) => {
                 debug!("Applying live debugger service config {config:?}");
                 fn build_regex(list: &FilterList) -> Option<Regex> {
@@ -277,7 +360,7 @@ fn remove_config(remote_config: &mut RemoteConfigState, debugger: &LiveDebugging
                     debug!("Removing live debugger probe {}", probe.id);
                     (callbacks.remove_probe)(id);
                 }
-            },
+            }
             LiveDebuggingData::ServiceConfiguration(ServiceConfiguration { id, .. }) => {
                 // There can only be one active service configuration, but I don't want to rely on the order of adding and removing service configurations
                 if id == &remote_config.live_debugger.config_id {
@@ -291,7 +374,10 @@ fn remove_config(remote_config: &mut RemoteConfigState, debugger: &LiveDebugging
 }
 
 #[no_mangle]
-pub extern "C" fn ddog_type_can_be_instrumented(remote_config: &RemoteConfigState, typename: CharSlice) -> bool {
+pub extern "C" fn ddog_type_can_be_instrumented(
+    remote_config: &RemoteConfigState,
+    typename: CharSlice,
+) -> bool {
     if ddog_snapshot_redacted_type(typename) {
         return false;
     }
@@ -313,7 +399,11 @@ pub extern "C" fn ddog_type_can_be_instrumented(remote_config: &RemoteConfigStat
 
 #[no_mangle]
 pub extern "C" fn ddog_global_log_probe_limiter_inc(remote_config: &RemoteConfigState) -> bool {
-    if let Some(boxed) = remote_config.live_debugger.active.get(&remote_config.live_debugger.config_id) {
+    if let Some(boxed) = remote_config
+        .live_debugger
+        .active
+        .get(&remote_config.live_debugger.config_id)
+    {
         if let (LiveDebuggingData::ServiceConfiguration(config), limiter) = &**boxed {
             limiter.inc(config.sampling_snapshots_per_second)
         } else {
@@ -330,7 +420,12 @@ pub unsafe extern "C" fn ddog_CharSlice_to_owned(str: CharSlice) -> *mut Vec<c_c
 }
 
 #[no_mangle]
-pub extern "C" fn ddog_remote_configs_service_env_change(remote_config: &mut RemoteConfigState, service: CharSlice, env: CharSlice, version: CharSlice) -> bool {
+pub extern "C" fn ddog_remote_configs_service_env_change(
+    remote_config: &mut RemoteConfigState,
+    service: CharSlice,
+    env: CharSlice,
+    version: CharSlice,
+) -> bool {
     let new_target = Target {
         service: service.to_utf8_lossy().to_string(),
         env: env.to_utf8_lossy().to_string(),
@@ -345,13 +440,21 @@ pub extern "C" fn ddog_remote_configs_service_env_change(remote_config: &mut Rem
 
     remote_config.manager.track_target(&Arc::new(new_target));
     ddog_process_remote_configs(remote_config);
-    
+
     true
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ddog_remote_config_alter_dynamic_config(remote_config: &mut RemoteConfigState, config: CharSlice, new_value: CharSlice) -> bool {
-    if let Some(entry) = remote_config.dynamic_config.old_config_values.get_mut(config.try_to_utf8().unwrap()) {
+pub unsafe extern "C" fn ddog_remote_config_alter_dynamic_config(
+    remote_config: &mut RemoteConfigState,
+    config: CharSlice,
+    new_value: CharSlice,
+) -> bool {
+    if let Some(entry) = remote_config
+        .dynamic_config
+        .old_config_values
+        .get_mut(config.try_to_utf8().unwrap())
+    {
         *entry = new_value.as_slice().into();
         return false;
     }
@@ -359,7 +462,10 @@ pub unsafe extern "C" fn ddog_remote_config_alter_dynamic_config(remote_config: 
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ddog_setup_remote_config(update_config: DynamicConfigUpdate, setup: &LiveDebuggerSetup) {
+pub unsafe extern "C" fn ddog_setup_remote_config(
+    update_config: DynamicConfigUpdate,
+    setup: &LiveDebuggerSetup,
+) {
     ddog_register_expr_evaluator(setup.evaluator);
     DYNAMIC_CONFIG_UPDATE = Some(update_config);
     LIVE_DEBUGGER_CALLBACKS = Some(setup.callbacks.clone());
@@ -383,21 +489,51 @@ pub extern "C" fn ddog_shutdown_remote_config(_: Box<RemoteConfigState>) {}
 #[no_mangle]
 pub extern "C" fn ddog_log_debugger_data(payloads: &Vec<DebuggerPayload>) {
     if !payloads.is_empty() {
-        debug!("Submitting debugger data: {}", serde_json::to_string(payloads).unwrap());
+        debug!(
+            "Submitting debugger data: {}",
+            serde_json::to_string(payloads).unwrap()
+        );
     }
 }
 
 #[no_mangle]
 pub extern "C" fn ddog_log_debugger_datum(payload: &DebuggerPayload) {
-    debug!("Submitting debugger data: {}", serde_json::to_string(payload).unwrap());
+    debug!(
+        "Submitting debugger data: {}",
+        serde_json::to_string(payload).unwrap()
+    );
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ddog_send_debugger_diagnostics<'a>(remote_config_state: &RemoteConfigState, transport: &mut Box<SidecarTransport>, instance_id: &InstanceId, queue_id: QueueId, probe: &'a Probe, timestamp: u64) -> MaybeError {
-    let service = Cow::Borrowed(remote_config_state.manager.get_target().map_or("", |t| t.service.as_str()));
-    let mut payload = ddog_debugger_diagnostics_create_unboxed(probe, service, Cow::Borrowed(&instance_id.runtime_id), timestamp);
-    let DebuggerData::Diagnostics(ref mut diagnostics) = payload.debugger else { unreachable!(); };
-    diagnostics.parent_id = Some(Cow::Borrowed(remote_config_state.manager.current_runtime_id.as_str()));
-    debug!("Submitting debugger diagnostics data: {:?}", serde_json::to_string(&payload).unwrap());
+pub unsafe extern "C" fn ddog_send_debugger_diagnostics<'a>(
+    remote_config_state: &RemoteConfigState,
+    transport: &mut Box<SidecarTransport>,
+    instance_id: &InstanceId,
+    queue_id: QueueId,
+    probe: &'a Probe,
+    timestamp: u64,
+) -> MaybeError {
+    let service = Cow::Borrowed(
+        remote_config_state
+            .manager
+            .get_target()
+            .map_or("", |t| t.service.as_str()),
+    );
+    let mut payload = ddog_debugger_diagnostics_create_unboxed(
+        probe,
+        service,
+        Cow::Borrowed(&instance_id.runtime_id),
+        timestamp,
+    );
+    let DebuggerData::Diagnostics(ref mut diagnostics) = payload.debugger else {
+        unreachable!();
+    };
+    diagnostics.parent_id = Some(Cow::Borrowed(
+        remote_config_state.manager.current_runtime_id.as_str(),
+    ));
+    debug!(
+        "Submitting debugger diagnostics data: {:?}",
+        serde_json::to_string(&payload).unwrap()
+    );
     ddog_sidecar_send_debugger_data(transport, instance_id, queue_id, vec![payload])
 }

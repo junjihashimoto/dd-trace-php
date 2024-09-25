@@ -81,8 +81,8 @@ void extract_data(
 void asm_data_aggregator::add(const config &config)
 {
     rapidjson::Document serialized_doc;
-    if (!json_helper::get_json_base64_encoded_content(
-            config.contents, serialized_doc)) {
+    if (!json_helper::parse_json(
+            config.read(), serialized_doc)) {
         throw error_applying_config("Invalid config contents");
     }
 

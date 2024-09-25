@@ -35,6 +35,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     # Bind symbols lookup of symbols defined in the library to the library itself
     # also avoids relocation problems with libc++.a on linux/aarch64
     target_link_options(ddappsec-helper PRIVATE -Wl,-Bsymbolic)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    target_link_options(ddappsec-helper PRIVATE -undefined dynamic_lookup)
 endif()
 set_target_properties(ddappsec-helper PROPERTIES
     CXX_VISIBILITY_PRESET hidden

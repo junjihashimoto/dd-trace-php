@@ -31,7 +31,7 @@ void asm_aggregator::init(rapidjson::Document::AllocatorType *allocator)
 void asm_aggregator::add(const config &config)
 {
     rapidjson::Document doc(&ruleset_.GetAllocator());
-    if (!json_helper::get_json_base64_encoded_content(config.contents, doc)) {
+    if (!json_helper::parse_json(config.read(), doc)) {
         throw error_applying_config("Invalid config contents");
     }
 

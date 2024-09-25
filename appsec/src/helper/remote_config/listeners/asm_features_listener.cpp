@@ -13,9 +13,9 @@
 
 void dds::remote_config::asm_features_listener::on_update(const config &config)
 {
+    const std::string contents{config.read()};
     rapidjson::Document serialized_doc;
-    if (!json_helper::get_json_base64_encoded_content(
-            config.contents, serialized_doc)) {
+    if (!json_helper::parse_json(contents, serialized_doc)) {
         throw error_applying_config("Invalid config contents");
     }
 

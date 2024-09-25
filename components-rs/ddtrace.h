@@ -129,9 +129,9 @@ extern ddog_Uuid ddtrace_runtime_id;
 
 extern void (*ddog_log_callback)(ddog_CharSlice);
 
-extern const enum ddog_RemoteConfigProduct DDTRACE_REMOTE_CONFIG_PRODUCTS[2];
+extern const enum ddog_RemoteConfigProduct DDTRACE_REMOTE_CONFIG_PRODUCTS[6];
 
-extern const enum ddog_RemoteConfigCapabilities DDTRACE_REMOTE_CONFIG_CAPABILITIES[6];
+extern const enum ddog_RemoteConfigCapabilities DDTRACE_REMOTE_CONFIG_CAPABILITIES[16];
 
 extern const uint8_t *DDOG_PHP_FUNCTION;
 
@@ -167,7 +167,15 @@ uint32_t ddog_get_logs_count(ddog_CharSlice level);
 
 struct ddog_RemoteConfigState *ddog_init_remote_config(ddog_CharSlice tracer_version,
                                                        const struct ddog_Endpoint *endpoint,
-                                                       bool live_debugging_enabled);
+                                                       bool live_debugging_enabled,
+                                                       bool appsec_features,
+                                                       bool appsec_config);
+
+void ddog_remote_config_get_products(const struct ddog_RemoteConfigState *state,
+                                     const enum ddog_RemoteConfigProduct **products,
+                                     uintptr_t *products_len);
+
+const char *ddog_remote_config_get_path(const struct ddog_RemoteConfigState *remote_config);
 
 void ddog_process_remote_configs(struct ddog_RemoteConfigState *remote_config);
 

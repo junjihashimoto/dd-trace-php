@@ -8,7 +8,6 @@
 #include "engine_settings.hpp"
 #include "msgpack_helpers.hpp"
 #include "remote_config/settings.hpp"
-#include "service_identifier.hpp"
 #include <msgpack.hpp>
 #include <optional>
 #include <type_traits>
@@ -101,7 +100,6 @@ struct client_init {
         std::string runtime_version;
         std::optional<bool> enabled_configuration;
 
-        dds::service_identifier service;
         dds::engine_settings engine_settings;
         dds::remote_config::settings rc_settings;
 
@@ -113,7 +111,7 @@ struct client_init {
         ~request() override = default;
 
         MSGPACK_DEFINE(pid, client_version, runtime_version,
-            enabled_configuration, service, engine_settings, rc_settings);
+            enabled_configuration, engine_settings, rc_settings);
     };
 
     struct response : base_response_generic<response> {
@@ -223,7 +221,10 @@ struct config_sync {
         request(request &&) = default;
         request &operator=(request &&) = default;
         ~request() override = default;
-        MSGPACK_DEFINE()
+
+        std::string rem_cfg_path;
+
+        MSGPACK_DEFINE(rem_cfg_path)
     };
 
     struct response : base_response_generic<response> {
@@ -260,6 +261,7 @@ struct request_shutdown {
         static constexpr request_id id = request_id::request_shutdown;
 
         dds::parameter data;
+        std::string rem_cfg_path;
 
         request() = default;
         request(const request &) = delete;
@@ -268,7 +270,7 @@ struct request_shutdown {
         request &operator=(request &&) = default;
         ~request() override = default;
 
-        MSGPACK_DEFINE(data)
+        MSGPACK_DEFINE(data, rem_cfg_path)
     };
 
     struct response : base_response_generic<response> {

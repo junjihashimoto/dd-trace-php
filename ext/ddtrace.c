@@ -1,3 +1,5 @@
+#include <dlfcn.h>
+#include <zend_modules.h>
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
@@ -395,6 +397,8 @@ bool ddtrace_alter_dd_version(zval *old_value, zval *new_value, zend_string *new
     return dd_alter_prop(XtOffsetOf(ddtrace_span_properties, property_version), old_value, new_value, new_str);
 }
 
+static zend_module_entry *dd_appsec_module() { return zend_hash_str_find_ptr(&module_registry, "ddappsec", sizeof("ddappsec") - 1); }
+
 static void dd_activate_once(void) {
     ddtrace_config_first_rinit();
     ddtrace_generate_runtime_id();
@@ -416,8 +420,8 @@ static void dd_activate_once(void) {
                 bgs_service = ddtrace_default_service_name();
             }
         }
-        zend_module_entry *appsec_module = zend_hash_str_find_ptr(&module_registry, "ddappsec", sizeof("ddappsec") - 1);
-        if (get_global_DD_INSTRUMENTATION_TELEMETRY_ENABLED() || get_global_DD_TRACE_SIDECAR_TRACE_SENDER() || appsec_module)
+        if (get_global_DD_INSTRUMENTATION_TELEMETRY_ENABLED() || get_global_DD_TRACE_SIDECAR_TRACE_SENDER() ||
+            (dd_appsec_module() != NULL && !get_global_DD_APPSEC_TESTING()))
 #endif
         {
             bool request_startup = PG(during_request_startup);
@@ -1498,7 +1502,26 @@ static void dd_initialize_request(void) {
     }
 
     if (!DDTRACE_G(remote_config_state) && ddtrace_endpoint) {
-        DDTRACE_G(remote_config_state) = ddog_init_remote_config(DDOG_CHARSLICE_C(PHP_DDTRACE_VERSION), ddtrace_endpoint, get_global_DD_DYNAMIC_INSTRUMENTATION_ENABLED());
+        bool appsec_features = false;
+        bool appsec_config = false;
+
+        zend_module_entry *appsec_module = dd_appsec_module();
+        if (appsec_module) {
+            typedef void (*dd_appsec_rc_conf_t)(bool *, bool *);
+            static dd_appsec_rc_conf_t dd_appsec_rc_conf;
+            if (!dd_appsec_rc_conf) {
+                // benign race
+                dd_appsec_rc_conf = dlsym(RTLD_DEFAULT, "dd_appsec_rc_conf");
+            }
+            if (dd_appsec_rc_conf) {
+                dd_appsec_rc_conf(&appsec_features, &appsec_config);
+            } else {
+                LOG(WARN, "Could not resolve dd_appsec_rc_conf");
+            }
+        }
+
+        DDTRACE_G(remote_config_state) = ddog_init_remote_config(DDOG_CHARSLICE_C(PHP_DDTRACE_VERSION), ddtrace_endpoint,
+                                                                 get_global_DD_DYNAMIC_INSTRUMENTATION_ENABLED(), appsec_features, appsec_config);
     }
 
     if (DDTRACE_G(remote_config_state)) {
